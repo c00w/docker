@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -55,8 +56,8 @@ func (cli *DockerCli) getMethod(name string) (func(...string) error, bool) {
 	return method.Interface().(func(...string) error), true
 }
 
-func ParseCommands(proto, addr string, args ...string) error {
-	cli := NewDockerCli(os.Stdin, os.Stdout, os.Stderr, proto, addr)
+func ParseCommands(proto, addr string, tlsConfig *tls.Config, args ...string) error {
+	cli := NewDockerCli(os.Stdin, os.Stdout, os.Stderr, proto, addr, tlsConfig)
 
 	if len(args) > 0 {
 		method, exists := cli.getMethod(args[0])
@@ -2249,6 +2250,13 @@ func (cli *DockerCli) CmdLoad(args ...string) error {
 	return nil
 }
 
+func (cli *DockerCli) dial() (net.Conn, error) {
+	if cli.tlsConfig != nil && cli.proto != "unix" {
+		return tls.Dial(cli.proto, cli.addr, cli.tlsConfig)
+	}
+	return net.Dial(cli.proto, cli.addr)
+}
+
 func (cli *DockerCli) newRequest(method, path string, header http.Header, in io.Reader) (*http.Request, error) {
 	// fixme: refactor client to support redirect
 	re := regexp.MustCompile("/+")
@@ -2264,38 +2272,37 @@ func (cli *DockerCli) newRequest(method, path string, header http.Header, in io.
 	return req, nil
 }
 
-func (cli *DockerCli) request(method, path string, header http.Header, in io.Reader) (*http.Response, error) {
+func (cli *DockerCli) request(method, path string, header http.Header, in io.Reader) (*http.Response, *httputil.ClientConn, error) {
 	req, err := cli.newRequest(method, path, header, in)
-	dial, err := net.Dial(cli.proto, cli.addr)
+	dial, err := cli.dial()
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
-			return nil, ErrConnectionRefused
+			return nil, nil, ErrConnectionRefused
 		}
-		return nil, err
+		return nil, nil, err
 	}
-
 	clientconn := httputil.NewClientConn(dial, nil)
 	resp, err := clientconn.Do(req)
 	if err != nil {
 		clientconn.Close()
 		if strings.Contains(err.Error(), "connection refused") {
-			return nil, ErrConnectionRefused
+			return nil, nil, ErrConnectionRefused
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	defer clientconn.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 		body, err := ioutil.ReadAll(resp.Body)
+		clientconn.Close()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if len(body) == 0 {
-			return nil, fmt.Errorf("Error :%s", http.StatusText(resp.StatusCode))
+			return nil, nil, fmt.Errorf("Error :%s", http.StatusText(resp.StatusCode))
 		}
-		return nil, fmt.Errorf("Error: %s", bytes.TrimSpace(body))
+		return nil, nil, fmt.Errorf("Error: %s", bytes.TrimSpace(body))
 	}
-	return resp, nil
+	return resp, clientconn, nil
 }
 
 func (cli *DockerCli) call(method, path string, data interface{}) (io.ReadCloser, int, error) {
@@ -2314,7 +2321,7 @@ func (cli *DockerCli) call(method, path string, data interface{}) (io.ReadCloser
 	} else if method == "POST" {
 		header.Set("Content-Type", "plain/text")
 	}
-	resp, err := cli.request(method, path, header, in)
+	resp, clientconn, err := cli.request(method, path, header, in)
 	if err != nil {
 		return nil, -1, err
 	}
@@ -2336,10 +2343,11 @@ func (cli *DockerCli) stream(method, path string, in io.Reader, out io.Writer, h
 		header.Set("Content-Type", "plain/text")
 	}
 
-	resp, err := cli.request(method, path, header, in)
+	resp, clientconn, err := cli.request(method, path, header, in)
 	if err != nil {
 		return err
 	}
+	defer clientconn.Close()
 	defer resp.Body.Close()
 
 	if matchesContentType(resp.Header.Get("Content-Type"), "application/json") {
@@ -2357,12 +2365,12 @@ func (cli *DockerCli) hijack(method, path string, setRawTerminal bool, in io.Rea
 			close(started)
 		}
 	}()
-	req, err := cli.newRequest(method, path, map[string][]string{"Content-Type": []string{"plain/text"}}, nil)
+	req, err := cli.newRequest(method, path, map[string][]string{"Content-Type": {"plain/text"}}, nil)
 	if err != nil {
 		return err
 	}
 
-	dial, err := net.Dial(cli.proto, cli.addr)
+	dial, err := cli.dial()
 	if err != nil {
 		if strings.Contains(err.Error(), "connection refused") {
 			return fmt.Errorf("Can't connect to docker daemon. Is 'docker -d' running on this host?")
@@ -2560,7 +2568,7 @@ func readBody(stream io.ReadCloser, statusCode int, err error) ([]byte, int, err
 	return body, statusCode, nil
 }
 
-func NewDockerCli(in io.ReadCloser, out, err io.Writer, proto, addr string) *DockerCli {
+func NewDockerCli(in io.ReadCloser, out, err io.Writer, proto, addr string, tlsConfig *tls.Config) *DockerCli {
 	var (
 		isTerminal = false
 		terminalFd uintptr
@@ -2584,12 +2592,14 @@ func NewDockerCli(in io.ReadCloser, out, err io.Writer, proto, addr string) *Doc
 		err:        err,
 		isTerminal: isTerminal,
 		terminalFd: terminalFd,
+		tlsConfig:  tlsConfig,
 	}
 }
 
 type DockerCli struct {
 	proto      string
 	addr       string
+	tlsConfig  *tls.Config
 	configFile *auth.ConfigFile
 	in         io.ReadCloser
 	out        io.Writer

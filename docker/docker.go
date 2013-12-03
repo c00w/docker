@@ -1,12 +1,15 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"github.com/dotcloud/docker"
 	"github.com/dotcloud/docker/engine"
 	flag "github.com/dotcloud/docker/pkg/mflag"
 	"github.com/dotcloud/docker/sysinit"
 	"github.com/dotcloud/docker/utils"
+	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -15,6 +18,8 @@ import (
 var (
 	GITCOMMIT string
 	VERSION   string
+
+	dockerConfDir = os.Getenv("HOME") + "/.docker/"
 )
 
 func main() {
@@ -41,8 +46,11 @@ func main() {
 		flGraphDriver        = flag.String([]string{"s", "-storage-driver"}, "", "Force the docker runtime to use a specific storage driver")
 		flHosts              = docker.NewListOpts(docker.ValidateHost)
 		flMtu                = flag.Int([]string{"#mtu", "-mtu"}, docker.DefaultNetworkMtu, "Set the containers network mtu")
-		flCert               = flag.String([]string{"#sslcert", "sslcert"}, "", "path to SSL certificate file")
-		flKey                = flag.String([]string{"#sslkey", "sslkey"}, "", "path to SSL key file")
+		flTls                = flag.Bool([]string{"#tls", "-tls"}, false, "Use TLS; implied by tls-verify flags")
+		flTlsVerify          = flag.Bool([]string{"#tlsverify", "-tlsverify"}, false, "Use TLS and verify the remote (daemon: verify client, client: verify daemon)")
+		flCa                 = flag.String([]string{"#tlscacert", "-tlscacert"}, dockerConfDir+"ca.pem", "Trust only remotes providing a certificate signed by the CA given here")
+		flCert               = flag.String([]string{"#tlscert", "-tlscert"}, dockerConfDir+"cert.pem", "Path to TLS certificate file")
+		flKey                = flag.String([]string{"#tlskey", "-tlskey"}, dockerConfDir+"key.pem", "Path to TLS key file")
 	)
 	flag.Var(&flDns, []string{"#dns", "-dns"}, "Force docker to use specific DNS servers")
 	flag.Var(&flHosts, []string{"H", "-host"}, "Multiple tcp://host:port or unix://path/to/socket to bind in daemon mode, single connection otherwise")
@@ -67,12 +75,12 @@ func main() {
 		log.Fatal("You specified -b & --bip, mutually exclusive options. Please specify only one.")
 	}
 
-	if *flDebug {
-		os.Setenv("DEBUG", "1")
+	if (len(*flKey) > 0 && len(*flCert) == 0) || (len(*flKey) == 0 && len(*flCert) > 0) {
+		log.Fatalf("Need TLS cert and key to enable TLS authentication")
 	}
 
-	if (len(*flKey) > 0) != (len(*flCert) > 0) {
-		log.Fatal("sslcert or sslkey set without the other. Please set both to enable https")
+	if *flDebug {
+		os.Setenv("DEBUG", "1")
 	}
 
 	docker.GITCOMMIT = GITCOMMIT
@@ -101,8 +109,11 @@ func main() {
 		job.SetenvBool("InterContainerCommunication", *flInterContainerComm)
 		job.Setenv("GraphDriver", *flGraphDriver)
 		job.SetenvInt("Mtu", *flMtu)
-		job.Setenv("SslKey", *flKey)
-		job.Setenv("SslCert", *flCert)
+		job.SetenvBool("Tls", *flTls)
+		job.SetenvBool("TlsVerify", *flTlsVerify)
+		job.Setenv("TlsCa", *flCa)
+		job.Setenv("TlsCert", *flCert)
+		job.Setenv("TlsKey", *flKey)
 		if err := job.Run(); err != nil {
 			log.Fatal(err)
 		}
@@ -117,14 +128,53 @@ func main() {
 			log.Fatal("Please specify only one -H")
 		}
 		protoAddrParts := strings.SplitN(flHosts.GetAll()[0], "://", 2)
-		if err := docker.ParseCommands(protoAddrParts[0], protoAddrParts[1], flag.Args()...); err != nil {
-			if sterr, ok := err.(*utils.StatusError); ok {
+
+		var (
+			errc      error
+			tlsConfig tls.Config
+		)
+		tlsConfig.InsecureSkipVerify = true
+
+		// If we should verify the server, we need to load a trusted ca
+		if *flTlsVerify {
+			*flTls = true
+			certPool := x509.NewCertPool()
+			file, err := ioutil.ReadFile(*flCa)
+			if err != nil {
+				log.Fatalf("Couldn't read ca cert %s: %s", *flCa, err)
+			}
+			certPool.AppendCertsFromPEM(file)
+			tlsConfig.RootCAs = certPool
+			tlsConfig.InsecureSkipVerify = false
+		}
+
+		// If tls is enabled, try to load and send client certificates
+		if *flTls {
+			_, errCert := os.Stat(*flCert)
+			_, errKey := os.Stat(*flKey)
+			if errCert == nil && errKey == nil {
+				*flTls = true
+				cert, err := tls.LoadX509KeyPair(*flCert, *flKey)
+				if err != nil {
+					log.Fatalf("Couldn't load X509 key pair: %s", err)
+				}
+				tlsConfig.Certificates = []tls.Certificate{cert}
+			}
+		}
+
+		if *flTls {
+			errc = docker.ParseCommands(protoAddrParts[0], protoAddrParts[1], &tlsConfig, flag.Args()...)
+		} else {
+			errc = docker.ParseCommands(protoAddrParts[0], protoAddrParts[1], nil, flag.Args()...)
+		}
+		if errc != nil {
+			if sterr, ok := errc.(*utils.StatusError); ok {
 				if sterr.Status != "" {
 					log.Println(sterr.Status)
 				}
 				os.Exit(sterr.StatusCode)
 			}
-			log.Fatal(err)
+			log.Fatal(errc)
 		}
 	}
 }

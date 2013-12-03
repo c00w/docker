@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"code.google.com/p/go.net/websocket"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"expvar"
@@ -1236,15 +1237,30 @@ func ListenAndServe(proto, addr string, srv *Server, logging bool) error {
 		return e
 	}
 
-	if srv.runtime.config.SslCert != "" && srv.runtime.config.SslKey != "" {
-		tlsConfig := &tls.Config{}
-		tlsConfig.NextProtos = []string{"http/1.1"}
-		tlsConfig.Certificates = make([]tls.Certificate, 1)
-		cert, err := tls.LoadX509KeyPair(srv.runtime.config.SslCert, srv.runtime.config.SslKey)
+	protoName := "HTTP"
+	if proto != "unix" && srv.runtime.config.Tls {
+		cert, err := tls.LoadX509KeyPair(srv.runtime.config.TlsCert, srv.runtime.config.TlsKey)
 		if err != nil {
-			return fmt.Errorf("Couldn't load X509 key pair: %s", err)
+			return fmt.Errorf("Couldn't load X509 key pair (%s, %s): %s", err, srv.runtime.config.TlsCert, srv.runtime.config.TlsKey)
 		}
-		tlsConfig.Certificates[0] = cert
+		tlsConfig := &tls.Config{
+			NextProtos:   []string{"http/1.1"},
+			Certificates: []tls.Certificate{cert},
+		}
+		if srv.runtime.config.TlsVerify {
+			protoName = "HTTPS/authenticated"
+			certPool := x509.NewCertPool()
+			file, err := ioutil.ReadFile(srv.runtime.config.TlsCa)
+			if err != nil {
+				return fmt.Errorf("Couldn't read CA certificate: %s", err)
+			}
+			certPool.AppendCertsFromPEM(file)
+
+			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
+			tlsConfig.ClientCAs = certPool
+		} else {
+			protoName = "HTTPS/open"
+		}
 		l = tls.NewListener(l, tlsConfig)
 	}
 
@@ -1271,7 +1287,7 @@ func ListenAndServe(proto, addr string, srv *Server, logging bool) error {
 	}
 	httpSrv := http.Server{Addr: addr, Handler: r}
 
-	log.Printf("Listening for HTTP on %s (%s)\n", addr, proto)
+	log.Printf("Listening for %s on %s (%s)\n", protoName, addr, proto)
 	// Tell the init daemon we are accepting requests
 	go systemd.SdNotify("READY=1")
 	return httpSrv.Serve(l)

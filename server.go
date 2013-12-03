@@ -115,7 +115,7 @@ func (srv *Server) ListenAndServe(job *engine.Job) engine.Status {
 				log.Fatal(err)
 			}
 		case "tcp":
-			if !strings.HasPrefix(protoAddrParts[1], "127.0.0.1") {
+			if !strings.HasPrefix(protoAddrParts[1], "127.0.0.1") && !srv.runtime.config.TlsVerify {
 				log.Println("/!\\ DON'T BIND ON ANOTHER IP ADDRESS THAN 127.0.0.1 IF YOU DON'T KNOW WHAT YOU'RE DOING /!\\")
 			}
 		default:

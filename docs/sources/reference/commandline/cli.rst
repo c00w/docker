@@ -37,9 +37,15 @@ To list available commands, either run ``docker`` with no parameters or execute
       --icc=true: Enable inter-container communication
       --ip="0.0.0.0": Default IP address to use when binding container ports
       --iptables=true: Disable docker's addition of iptables rules
+      --mtu=1500: Set the containers network mtu
       -p, --pidfile="/var/run/docker.pid": Path to use for daemon PID file
       -r, --restart=true: Restart previously running containers
       -s, --storage-driver="": Force the docker runtime to use a specific storage driver
+      --tls=false: Use TLS; implied by tls-verify flags
+      --tlscacert="~/.docker/ca.pem": Trust only remotes providing a certificate signed by the CA given here
+      --tlscert="~/.docker/cert.pem": Path to TLS certificate file
+      --tlskey="~/.docker/key.pem": Path to TLS key file
+      --tlsverify=false: Use TLS and verify the remote (daemon: verify client, client: verify daemon)
       -v, --version=false: Print version information and quit
 
 The Docker daemon is the persistent process that manages containers.  Docker uses the same binary for both the 
@@ -1258,7 +1264,3 @@ Show the version of the Docker client, daemon, and latest released version.
 
     Block until a container stops, then print its exit code.
 
-Server Flags
-~~~~~~~~~~~~
-
-.. include:: server/https.rst
